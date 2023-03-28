@@ -8,9 +8,10 @@ import itertools
 import random
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import sys
 
-ENV_LOOKBACK = 1
-TREND = 8
+ENV_LOOKBACK = 5
+TREND = 20
 
 pd.set_option('display.max_rows', None)
 pd.set_option('display.max_columns', None)
@@ -25,7 +26,7 @@ class Lake(gym.Env):
         # Market Env, Current Position
         oil = pd.read_csv(r'C:\Users\stefa\PycharmProjects\Loon\firstrate\CL_continuous_UNadjusted_1min.txt',
                           names=['Date Time', 'Open_Wti', 'High_Wti', 'Low_Wti', 'Close_Wti', 'Volume'],
-                          nrows=10000, skiprows=4825000)  # 4825000, 4600000, 225000
+                          nrows=10000, skiprows=4825000)
 
         oil['Date Time'] = pd.to_datetime(oil['Date Time'])
         oil = oil.set_index('Date Time')
@@ -46,11 +47,12 @@ class Lake(gym.Env):
 
         print('Number of available training days ->', len(self.cleaned))
 
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4 * ENV_LOOKBACK,), dtype=np.float64)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(6 * ENV_LOOKBACK,), dtype=np.float64)
 
     def step(self, action):
 
-        self.reward = 0
+        # self.reward = 0
+        prev = self.account_bal
 
         self.cur_price = self.oil.iloc[self.index]['Close_Wti']
 
@@ -62,28 +64,32 @@ class Lake(gym.Env):
         elif action == 2 and self.contracts_avalible_to_trade == 0:
             self.to_close()
 
-        if self.index == len(self.oil) - 5:
+        self.changes.append((self.account_bal - prev) / prev)
 
-            self.done = True
-            self.to_close()
-            # if self.trade_count == 1:
-            #     self.reward = -0.5
-            # self.render()
-            print('Account Balance:', self.account_bal, 'Trade Count:', self.trade_count)
-
-        self.update_observation()
+        if self.index % 10 == 0:
+            self.reward = self.better_than_nothing()
 
         # If unable to trade, end the episode
         if floor(self.account_bal / self.margin_rec) - 1 == 0:
             # self.render()
+            # self.reward = self.better_than_nothing()
             self.done = True
+            print(self.account_bal)
+
+        if self.index == len(self.oil) - 5:
+            self.done = True
+            self.to_close()
+            print(self.account_bal)
+            # self.reward = self.better_than_nothing()
+
+
+        self.update_observation()
 
         self.observation = np.array(list(itertools.chain(*self.market_env)))
-        # self.observation = (self.observation - np.min(self.observation)) / (
-        #         np.max(self.observation) - np.min(self.observation))
+
+
 
         self.info = {}
-
 
         self.index += 1
 
@@ -92,26 +98,24 @@ class Lake(gym.Env):
     def reset(self):
         self.done = False
         self.reward = 0
-        self.booked_return = 0
+
         self.account_bal = 10000
         self.org_acc_bal = self.account_bal
-        self.position_balance = -1
-        self.position_longevity = 0
         self.position = 0
-        self.trade_count = 0
 
         self.margin_rec = 2700  # Initial intraday margin per MCL contract from CME
         self.slippage = 0.01
         self.contracts_avalible_to_trade = floor(self.account_bal / self.margin_rec) - 1
 
         self.oil = random.choice(self.cleaned)
-        # self.oil = self.cleaned[1]
+
 
         self.daily_trades_heading = ['Entry Price', 'Entry Time', 'Contract Quantity', 'Exit Price', 'Exit Time',
                                      'Profit ($)', 'Type (L/S)']
         self.daily_long_trades = pd.DataFrame(columns=self.daily_trades_heading)
         self.daily_short_trades = pd.DataFrame(columns=self.daily_trades_heading)
         self.account_changes = pd.DataFrame(columns=['Account Balance'])
+        self.changes = []
         self.trade_entry_time = None
 
         self.index = ENV_LOOKBACK
@@ -126,10 +130,8 @@ class Lake(gym.Env):
         for ind in range(ENV_LOOKBACK):
 
             initialize = self.oil.iloc[[ind]].values.flatten().tolist()
-            initialize = list(initialize[i] for i in [4, 5])
-
-
-            initialize.extend([self.position, 0])
+            initialize = list(initialize[i] for i in [3, 4, 5])
+            initialize.extend([self.position, self.open_p_l, self.account_bal - self.org_acc_bal])
             self.market_env.append(initialize)
 
             acc_change = pd.Series({'Account Balance': self.account_bal})
@@ -137,10 +139,6 @@ class Lake(gym.Env):
 
         self.observation = np.array(list(itertools.chain(*self.market_env)))
 
-
-
-        # self.observation = (self.observation - np.min(self.observation)) / (
-        #         np.max(self.observation) - np.min(self.observation))
 
         return self.observation
 
@@ -160,7 +158,6 @@ class Lake(gym.Env):
 
 
         self.trade_entry_time = self.oil.iloc[self.index].name
-        self.position_balance = self.account_bal
         self.contracts_avalible_to_trade = 0
 
     def to_close(self):
@@ -187,36 +184,19 @@ class Lake(gym.Env):
         self.contracts_long, self.contracts_short = 0, 0
         self.account_bal += self.open_p_l - (position * self.slippage * 100)
 
-        # if the return is greater than the cost of commissions,
-        # as well as opening and closing slippage (opening slippage built into opl)
-
-        position_return = ((self.account_bal - self.position_balance) / self.position_balance)
-        self.trade_count += 1
-
-        if position > 0:
-            self.reward = position_return
-
 
         self.contracts_avalible_to_trade = floor(self.account_bal / self.margin_rec) - 1
         self.open_p_l = 0
         self.position_price = -1
-        self.position_balance = -1
-        self.position_longevity = 0
         self.position = 0
 
         self.trade_entry_time = None
-        self.trades = deque(maxlen=25)
 
     def p_l(self):
         live_contracts = self.contracts_long + self.contracts_short
         interim_return = (live_contracts * (self.cur_price - self.position_price)) * 100
         if self.contracts_short > 0:
             interim_return = interim_return * -1
-
-        if live_contracts > 0:
-
-            self.position_longevity += 1
-
 
         return interim_return
 
@@ -281,17 +261,42 @@ class Lake(gym.Env):
         fig.update_layout(xaxis_rangeslider_visible=False)
         fig.show()
 
-    def update_observation(self, update_type='general'):
-        if update_type == 'general':
-            initialize = self.oil.iloc[[self.index]].values.flatten().tolist()
-            initialize_v = self.oil.iloc[[self.index]].values.flatten().tolist()
-            prev_init = self.oil.iloc[[self.index - 1]].values.flatten().tolist()
-            initialize = list(initialize[i] for i in [4, 5])
+    def update_observation(self):
 
-            initialize.extend(
-                [self.position, initialize_v[3] - prev_init[3]])
-            self.market_env.append(initialize)
+        initialize = self.oil.iloc[[self.index]].values.flatten().tolist()
+        initialize = list(initialize[i] for i in [3, 4, 5])
 
-            acc_change = pd.Series({'Account Balance': self.account_bal})
-            self.account_changes = pd.concat([self.account_changes, acc_change.to_frame().T], ignore_index=True)
+        initialize.extend([self.position, self.open_p_l, self.account_bal - self.org_acc_bal])
+        self.market_env.append(initialize)
+
+        acc_change = pd.Series({'Account Balance': self.account_bal})
+        self.account_changes = pd.concat([self.account_changes, acc_change.to_frame().T], ignore_index=True)
+
+    def better_than_nothing(self):
+        # calculate the reward based on the change in balance
+        # reward = (self.account_bal - self.org_acc_bal) / self.org_acc_bal
+        reward = ((self.account_bal + self.open_p_l) - self.org_acc_bal) / self.org_acc_bal
+
+        # calculate the Sortino ratio based on the returns
+        sortino_ratio = self._calculate_sortino_ratio()
+
+        # adjust the reward based on the Sortino ratio
+
+        if reward < 0 and sortino_ratio < 0:
+            reward *= 0.5
+        else:
+            reward *= sortino_ratio
+
+        # min_reward = -10
+        # reward = max(reward, min_reward)
+
+        return reward
+
+    def _calculate_sortino_ratio(self):
+        returns = np.array(self.changes)
+        downside_returns = np.minimum(returns, 0)
+        downside_std = np.std(downside_returns)
+        sortino_ratio = np.mean(returns) / downside_std if downside_std > 0 else 0
+        return sortino_ratio
+
 
